@@ -18,7 +18,8 @@ from VMR.Models.span_utils import span_cxw_to_xx, temporal_iou
 # ---------------------------------------------------------------------------
 
 def post_process_predictions(outputs, metas, duration_key="duration",
-                             top_k=5, nms_thresh=0.4):
+                             top_k=5, nms_thresh=0.4,
+                             use_refined_spans=True):
     """Convert raw model outputs to per-sample prediction lists.
 
     Args:
@@ -38,7 +39,10 @@ def post_process_predictions(outputs, metas, duration_key="duration",
     pred_logits = outputs["pred_logits"].detach().cpu()   # (B, Q)
     # Prefer locally-refined boundary predictions when available (v15+).
     # Falls back to coarse decoder output for older checkpoints.
-    _raw = outputs.get("pred_spans_refined", outputs["pred_spans"])
+    if use_refined_spans:
+        _raw = outputs.get("pred_spans_refined", outputs["pred_spans"])
+    else:
+        _raw = outputs["pred_spans"]
     pred_spans  = _raw.detach().cpu()                     # (B, Q, 2) cxw [0,1]
 
     # Quality score: pred_logits is now (B, Q) — single logit per query slot.
@@ -318,9 +322,10 @@ def evaluate_vmr(model, dataloader, device, cfg):
     from VMR.Datasets.vmr_data_provider import prepare_batch_inputs
 
     model.eval()
-    iou_thresholds = cfg.get("iou_thresholds", [0.5, 0.7])
-    top_k          = cfg.get("top_k", 5)
-    nms_thresh     = cfg.get("nms_thresh", 0.4)
+    iou_thresholds  = cfg.get("iou_thresholds", [0.5, 0.7])
+    top_k           = cfg.get("top_k", 5)
+    nms_thresh      = cfg.get("nms_thresh", 0.4)
+    use_refined     = cfg.get("use_refined_spans", True)
 
     all_preds          = []
     all_gt             = []
@@ -333,7 +338,8 @@ def evaluate_vmr(model, dataloader, device, cfg):
         outputs = model(**model_inputs)
 
         preds = post_process_predictions(outputs, batch_meta, top_k=top_k,
-                                         nms_thresh=nms_thresh)
+                                         nms_thresh=nms_thresh,
+                                         use_refined_spans=use_refined)
         gts   = extract_gt_windows(batch_meta)
 
         all_preds.extend(preds)

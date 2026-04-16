@@ -409,7 +409,11 @@ def main():
         logger.info(f"Resuming from {args.resume}")
         saved_cfg, state_dict, opt_state, sched_state, current_epoch, saved_metrics = load_ckpt(args.resume)
         raw_model = model.module if isinstance(model, nn.DataParallel) else model
-        raw_model.load_state_dict(state_dict)
+        _info = raw_model.load_state_dict(state_dict, strict=False)
+        if _info.missing_keys:
+            logger.info(f"  Missing keys (will use init): {_info.missing_keys}")
+        if _info.unexpected_keys:
+            logger.info(f"  Unexpected keys (ignored): {_info.unexpected_keys}")
         optimizer.load_state_dict(opt_state)
         if sched_state is not None:
             scheduler.load_state_dict(sched_state)
@@ -517,7 +521,11 @@ def main():
         if os.path.exists(best_ckpt):
             _, state_dict, _, _, _, _ = load_ckpt(best_ckpt)
             raw_model = model.module if isinstance(model, nn.DataParallel) else model
-            raw_model.load_state_dict(state_dict)
+            _info = raw_model.load_state_dict(state_dict, strict=False)
+            if _info.missing_keys:
+                logger.info(f"  Missing keys (will use init): {_info.missing_keys}")
+            if _info.unexpected_keys:
+                logger.info(f"  Unexpected keys (ignored): {_info.unexpected_keys}")
 
         test_metrics = val_one_epoch(-1, test_loader, model, cfg, device, logger)
         logger.info("Test results:")

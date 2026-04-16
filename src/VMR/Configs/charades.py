@@ -15,7 +15,7 @@ cfg = dict(_qvh.cfg)   # inherit defaults, then override
 
 cfg["seed"]          = 2026
 
-cfg["model_name"]    = "HLFormer_VMR_SFCB_v35"   # v34: boundary_refine=4.0 from ep0, saliency=0.05, max_v_l=128, cosine_T0=50, warmup=10, lr=2e-4, alpha_iou=3.0, ema_decay=0.9995
+cfg["model_name"]    = "HLFormer_VMR_SFCB_v36"   # v36: text+width conditioned sigma in BoundaryRefinementHead, max_delta=0.15, loss cap at 6.0
 cfg["dataset_name"]  = "charades_sta"
 cfg["dset_name"]     = "charades_sta"
 
@@ -62,6 +62,8 @@ cfg["sft_factor"]     = 0.1   # v11=0.06; stronger query-conditioned feature shi
 # v11=False; enabling text-in-memory makes encoder query-conditioned (not just decoder)
 cfg["use_txt_in_memory"]     = True
 cfg["use_global_in_encoder"] = True
+
+cfg["use_refined_spans"] = True
 
 # ---- Hyperbolic entailment -----------------------------------------------
 # v14 enhancements:
@@ -114,9 +116,7 @@ cfg["boundary_refine_coef"]           = 4.0   # v34: 1.0→4.0; start at high we
 cfg["boundary_refine_giou_coef"]      = 4.0   # v34: same rationale as boundary_refine_coef
 cfg["boundary_refine_window"]         = 12     # v34: at max_v_l=77, sigma=16/154≈0.10 (10% of video); tight enough for precise boundary pooling
 cfg["boundary_refine_learnable_sigma"] = True
-cfg["boundary_refine_max_delta"]      = 0.25  # v34: ±32 frames at max_v_l=128; generous cap allows
-                                               # correcting large boundary errors common in Charades
-                                               # (avg moment 8s, IoU=0.5→0.7 needs ~4-frame precision)
+cfg["boundary_refine_max_delta"]      = 0.15  # v36: 0.25→0.15; tighter cap, still ±11 frames at L=75
 cfg["alpha_iou_alpha"]                = 3.0   # v34: 2.5→3.0; stronger gradient amplification in 0.5-0.7 IoU zone
 
 # aux_loss_scale starts low: early decoder layers produce near-zero IoU targets,
@@ -139,10 +139,10 @@ cfg["nms_thresh"] = 0.5  # v32: 0.3→0.5; more lenient NMS — R1 only cares ab
 # ---- Optimizer -----------------------------------------------------------
 cfg["lr"]            = 1.5e-4  # v34: 1e-4→2e-4; stronger gradient signal, more budget before cosine trough
 cfg["lr_vid_enc"]    = 0.75e-4   # v34: 5e-5→1e-4; proportional to lr increase
-cfg["lr_drop"]       = 25     # kept for backward compat; unused when cosine_T0 > 0
+cfg["lr_drop"]       = 30     # kept for backward compat; unused when cosine_T0 > 0
 cfg["lr_gamma"]      = 0.5    # kept for backward compat
 cfg["warmup_epochs"] = 5     # v34: 5→10; longer warmup avoids early loss spikes with higher lr
-cfg["cosine_T0"]     = 30     # v34: 30→50; longer first cosine cycle gives more budget before LR trough
+cfg["cosine_T0"]     = 35     # v34: 30→50; longer first cosine cycle gives more budget before LR trough
 cfg["cosine_Tmult"]  = 2      # v32: NEW; second cycle = 60 epochs (total ~90 before 2nd restart)
 cfg["cosine_eta_min_ratio"] = 0.01  # v32: NEW; min LR = 1% of base at cycle trough
 cfg["wd"]            = 5e-5   # v32: 5e-6→1e-4; 20x increase to regularize weights (5e-6 is effectively zero)
@@ -172,21 +172,21 @@ cfg["feat_noise_std"]      = 0.0  # v32: Gaussian noise σ added to projected fe
 # v34 schedule: boundary refinement starts at 4.0 from ep0 (zero-init guarantees safety),
 # saliency/hyp_saliency deprioritized globally, alpha_iou weighted 70%.
 #
-# Phase 1  (ep  0-19): Coarse localization — boundary refine at 4.0 (active from start),
-#                       zero-init head gradually activates, contrastive alignment strong.
-# Phase 2  (ep 20-39): Boundary refinement jumps to 7.0 — refine head actively correcting.
-# Phase 3  (ep 40-59): IoU dominant — reduce span L1, amplify giou+boundary.
-# Phase 4  (ep 60+  ): Maximum boundary precision (10.0) under cosine LR trough.
+# Phase 1  (ep  0-14): Coarse localization — boundary refine at 1.0 (head warms up),
+#                       zero-init head activates gradually.
+# Phase 2  (ep 15-19): Boundary refine jumps to 4.0 — refine head actively correcting.
+# Phase 3  (ep 20-39): Boundary refine at 5.0 — refine head learns width+text conditioning.
+# Phase 4  (ep 40-59): IoU dominant — span L1 reduces, giou+boundary amplified.  Cap at 6.0.
+# Phase 5  (ep 60+  ): Cap at 6.0 — refinement must not dominate over decoder supervision.
 #
 # Static cfg values above must match Phase 1 so build_criterion() starts correctly.
 cfg["loss_schedule"] = [
     (0, {
-        # v34: boundary refine starts at 4.0 (matches static cfg; zero-init is safe).
-        # saliency/hyp_saliency are reduced globally via lw_saliency=0.05.
+        # v36: boundary refine starts at 1.0 to let text+width conditioning warm up first.
         "span_loss_coef":             10.0,
         "giou_loss_coef":              6.0,
-        "boundary_refine_coef":        1.0,   # v34: 1.0→4.0; start high since head is zero-init
-        "boundary_refine_giou_coef":   1.0,   # v34: 1.0→4.0; same
+        "boundary_refine_coef":        1.0,
+        "boundary_refine_giou_coef":   1.0,
         "contrastive_align_loss_coef": 0.15,
         "loss_pop_coef":               0.1,
         "aux_loss_scale":              0.2,
@@ -195,13 +195,13 @@ cfg["loss_schedule"] = [
         "set_cost_giou":               2.0,
     }),
     (15, {
-      "boundary_refine_coef":        4.0,   # v34: 1.0→4.0; start high since head is zero-init
-      "boundary_refine_giou_coef":   4.0,
+        "boundary_refine_coef":        4.0,
+        "boundary_refine_giou_coef":   4.0,
     }),
     (20, {
-        # Boundary refinement ramps to next tier — refine head now actively correcting
-        "boundary_refine_coef":        7.0,   # v34: 4.0→7.0; next step since we start at 4.0
-        "boundary_refine_giou_coef":   7.0,   # v34: same
+        # Boundary refinement ramps — width+text conditioning now has gradient signal
+        "boundary_refine_coef":        5.0,
+        "boundary_refine_giou_coef":   5.0,
         "aux_loss_scale":              0.3,
         "set_cost_class":              2.5,
         "set_cost_giou":               2.5,
@@ -210,8 +210,8 @@ cfg["loss_schedule"] = [
         # IoU dominant — shift emphasis toward boundary precision
         "span_loss_coef":              8.0,
         "giou_loss_coef":              7.0,
-        "boundary_refine_coef":        8.0,   # v34: 7.0→8.0
-        "boundary_refine_giou_coef":   8.0,
+        "boundary_refine_coef":        6.0,   # v36: cap at 6.0 (not 8.0) — decoder leads
+        "boundary_refine_giou_coef":   6.0,
         "contrastive_align_loss_coef": 0.05,
         "loss_pop_coef":               0.05,
         "set_cost_class":              3.0,
@@ -219,11 +219,11 @@ cfg["loss_schedule"] = [
         "set_cost_giou":               3.0,
     }),
     (60, {
-        # Maximum boundary precision under cosine LR trough
+        # Maximum boundary precision under cosine LR trough — cap at 6.0
         "span_loss_coef":              6.0,
         "giou_loss_coef":              8.0,
-        "boundary_refine_coef":       10.0,
-        "boundary_refine_giou_coef":  10.0,
+        "boundary_refine_coef":        6.0,   # v36: cap at 6.0 (not 10.0)
+        "boundary_refine_giou_coef":   6.0,
         "set_cost_class":              3.5,
     }),
 ]

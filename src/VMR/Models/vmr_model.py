@@ -402,10 +402,16 @@ class BoundaryRefinementHead(nn.Module):
     offset via a small MLP.  The head operates in (start, end) space and
     converts back to (center, width) on return.
 
+    Sigma is conditioned on both span width (geometric) and a cross-modal
+    text representation (semantic).  Wider spans get a wider pooling window;
+    queries with semantically diffuse descriptions also widen their window.
+    All conditioning terms are zero-initialized so training starts from
+    scalar-sigma behaviour and learns the conditioning gradually.
+
     Args:
         H:             Model hidden size.
-        window_frames: Number of frames defining the Gaussian sigma
-                       (sigma = window_frames / (2 * L)).  Default 8.
+        window_frames: Number of frames defining the base Gaussian sigma
+                       (sigma_base = window_frames / (2 * max_v_l)).  Default 8.
         max_delta:     Maximum absolute shift of each boundary in normalized
                        [0, 1] coords.  tanh gates keep deltas in
                        (−max_delta, +max_delta).  Default 0.1 (≈12 frames at L=128).
@@ -416,42 +422,69 @@ class BoundaryRefinementHead(nn.Module):
         super().__init__()
         self.max_delta        = max_delta
         self.learnable_sigma  = learnable_sigma
-        # Gaussian sigma per boundary in normalized [0,1] space.
+        self._H               = H
+        # Base Gaussian sigma per boundary in normalized [0,1] space.
         # Initialised so sigma ≈ window_frames / (2 * max_v_l).
         init_log_sigma = math.log(max(window_frames / (2.0 * max_v_l), 1e-6))
         if learnable_sigma:
             self.log_sigma_start = nn.Parameter(torch.tensor(init_log_sigma))
             self.log_sigma_end   = nn.Parameter(torch.tensor(init_log_sigma))
+            # Width-scale: multiplies predicted span width in log-sigma space.
+            # Zero-init → starts as pure base sigma, grows with training.
+            self.sigma_width_scale_start = nn.Parameter(torch.tensor(0.0))
+            self.sigma_width_scale_end   = nn.Parameter(torch.tensor(0.0))
         else:
             self.register_buffer("log_sigma_start", torch.tensor(init_log_sigma))
             self.register_buffer("log_sigma_end",   torch.tensor(init_log_sigma))
-        # Joint MLP: takes concatenated (start_feat, end_feat) → (delta_s, delta_e).
-        # Predicting both boundaries together captures their correlation — e.g. when a
-        # moment is too long both boundaries should move inward jointly, not independently.
-        self.joint_mlp = MLP(2 * H, H, 2, 2)
+            self.register_buffer("sigma_width_scale_start", torch.tensor(0.0))
+            self.register_buffer("sigma_width_scale_end",   torch.tensor(0.0))
+        # Text-conditioned sigma offset: maps global cross-modal rep → 2 scalars
+        # (one per boundary).  Zero-init → text starts contributing nothing.
+        self.sigma_txt_proj = nn.Linear(H, 2, bias=True)
+        # Joint MLP: takes concatenated (start_feat, end_feat, txt_rep) → (delta_s, delta_e).
+        # Text context lets the MLP decide *which direction* to shift based on query semantics.
+        # txt_rep defaults to zeros when not provided (backward-compat with old call sites).
+        self.joint_mlp = MLP(3 * H, H, 2, 2)
 
     def forward(
         self,
-        pred_spans: torch.Tensor,   # (B, Q, 2)  center/width in [0, 1]
-        vid_feat:   torch.Tensor,   # (B, L, H)
-        vid_mask:   torch.Tensor,   # (B, L)     1=valid
-    ) -> torch.Tensor:              # (B, Q, 2)  refined center/width in [0, 1]
+        pred_spans: torch.Tensor,          # (B, Q, 2)  center/width in [0, 1]
+        vid_feat:   torch.Tensor,          # (B, L, H)
+        vid_mask:   torch.Tensor,          # (B, L)     1=valid
+        txt_rep:    torch.Tensor = None,   # (B, H)     cross-modal global rep (optional)
+    ) -> torch.Tensor:                     # (B, Q, 2)  refined center/width in [0, 1]
         B, Q, _ = pred_spans.shape
         L, H    = vid_feat.shape[1], vid_feat.shape[2]
         dev     = vid_feat.device
 
         start = (pred_spans[..., 0] - pred_spans[..., 1] / 2).clamp(0., 1.)  # (B, Q)
         end   = (pred_spans[..., 0] + pred_spans[..., 1] / 2).clamp(0., 1.)  # (B, Q)
+        width = pred_spans[..., 1]                                             # (B, Q)
 
-        # Gaussian soft-pooling around an anchor position
+        # Per-query sigma: base + width-scale * width + text-offset
+        # All conditioning terms are zero-init, so ep0 = pure scalar base sigma.
         t_pos   = torch.linspace(0., 1., L, device=dev)         # (L,)
         min_sig = 1.0 / (4.0 * L)                               # floor: 0.25 frames
-        sigma_s = self.log_sigma_start.exp().clamp(min=min_sig)  # scalar
-        sigma_e = self.log_sigma_end.exp().clamp(min=min_sig)    # scalar
+
+        if txt_rep is not None:
+            txt_off = self.sigma_txt_proj(txt_rep)               # (B, 2)
+            txt_off_s = txt_off[:, 0:1]                          # (B, 1)
+            txt_off_e = txt_off[:, 1:2]                          # (B, 1)
+        else:
+            txt_off_s = txt_off_e = torch.zeros(B, 1, device=dev, dtype=vid_feat.dtype)
+
+        log_sigma_s = (self.log_sigma_start
+                       + self.sigma_width_scale_start * width
+                       + txt_off_s)                              # (B, Q)
+        log_sigma_e = (self.log_sigma_end
+                       + self.sigma_width_scale_end   * width
+                       + txt_off_e)                              # (B, Q)
+        sigma_s = log_sigma_s.exp().clamp(min=min_sig)           # (B, Q)
+        sigma_e = log_sigma_e.exp().clamp(min=min_sig)           # (B, Q)
 
         def _pool(anchor, sigma):
-            # anchor: (B, Q), returns (B, Q, H)
-            dist2 = ((t_pos[None, None, :] - anchor[:, :, None]) / sigma) ** 2
+            # anchor: (B, Q), sigma: (B, Q), returns (B, Q, H)
+            dist2 = ((t_pos[None, None, :] - anchor[:, :, None]) / sigma[:, :, None]) ** 2
             w = torch.exp(-0.5 * dist2)                       # (B, Q, L)
             w = w * vid_mask[:, None, :].float()
             w = w / (w.sum(-1, keepdim=True).clamp(min=1e-8))
@@ -460,11 +493,16 @@ class BoundaryRefinementHead(nn.Module):
         start_feat = _pool(start, sigma_s)   # (B, Q, H)
         end_feat   = _pool(end,   sigma_e)   # (B, Q, H)
 
-        # Joint prediction: start and end deltas share context from both boundaries.
-        joint_feat = torch.cat([start_feat, end_feat], dim=-1)          # (B, Q, 2H)
+        # Joint prediction: start and end deltas conditioned on both boundaries + text.
+        # txt_rep (or zeros) appended so the MLP learns query-specific shifts.
+        if txt_rep is not None:
+            txt_expand = txt_rep.unsqueeze(1).expand(-1, Q, -1)  # (B, Q, H)
+        else:
+            txt_expand = torch.zeros(B, Q, H, device=dev, dtype=vid_feat.dtype)
+        joint_feat = torch.cat([start_feat, end_feat, txt_expand], dim=-1)   # (B, Q, 3H)
         deltas     = torch.tanh(self.joint_mlp(joint_feat)) * self.max_delta  # (B, Q, 2)
-        delta_s    = deltas[..., 0]                                      # (B, Q)
-        delta_e    = deltas[..., 1]                                      # (B, Q)
+        delta_s    = deltas[..., 0]                                           # (B, Q)
+        delta_e    = deltas[..., 1]                                           # (B, Q)
 
         start_r  = (start + delta_s).clamp(0., 1.)
         end_r    = (end   + delta_e).clamp(0., 1.)
@@ -677,6 +715,17 @@ class HLFormer_VMR(nn.Module):
         # Zero-init joint_mlp final layer so initial deltas=tanh(0)*max_delta=0 (identity start)
         nn.init.zeros_(self.boundary_refine.joint_mlp.layers[-1].weight)
         nn.init.zeros_(self.boundary_refine.joint_mlp.layers[-1].bias)
+        # Zero-init text+width conditioning terms so ep0 behaviour = scalar base sigma.
+        nn.init.zeros_(self.boundary_refine.sigma_txt_proj.weight)
+        nn.init.zeros_(self.boundary_refine.sigma_txt_proj.bias)
+        if self.boundary_refine.learnable_sigma:
+            nn.init.zeros_(self.boundary_refine.sigma_width_scale_start)
+            nn.init.zeros_(self.boundary_refine.sigma_width_scale_end)
+        # Zero-init text portion of joint_mlp first layer (columns 2H:3H) so text
+        # input starts contributing nothing and activates gradually.
+        with torch.no_grad():
+            _H = self.boundary_refine._H
+            self.boundary_refine.joint_mlp.layers[0].weight[:, 2 * _H:].zero_()
         # Zero-init caq_ref_head final layer so initial reference-point offsets=0.
         # This means at ep0 CAQ produces the same reference points as the static
         # uniform linspace init, and the offset grows as training progresses.
@@ -889,7 +938,8 @@ class HLFormer_VMR(nn.Module):
 
         # ---- 5b. Boundary refinement (local Gaussian pooling + MLP) --
         pred_spans_refined = self.boundary_refine(
-            pred_spans, vid_feat, src_vid_mask)                  # (B, Q, 2)
+            pred_spans, vid_feat, src_vid_mask,
+            txt_rep=global_rep)                               # (B, Q, 2)
 
         # ---- 6. Saliency (positive pair) -----------------------------
         saliency_scores = (

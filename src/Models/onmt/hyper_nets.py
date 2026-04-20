@@ -118,20 +118,21 @@ class LorentzMultiHeadedAttention(nn.Module):
         self.bias = nn.Parameter(torch.zeros(()))
         self.wid = wid
 
-    def generate_gauss_weight(self, props_len, width):
+    def generate_gauss_weight(self, props_len, width, device, dtype):
 
-        center = torch.arange(props_len).cuda() / props_len
-        width = width*torch.ones(props_len).cuda()
-        weight = torch.linspace(0, 1, props_len)
-        weight = weight.view(1, -1).expand(center.size(0), -1).to(center.device)
+        center = torch.arange(props_len, device=device, dtype=dtype) / props_len
+        width = width * torch.ones(props_len, device=device, dtype=dtype)
+        weight = torch.linspace(0, 1, props_len, device=device, dtype=dtype)
+        weight = weight.view(1, -1).expand(center.size(0), -1)
         center = center.unsqueeze(-1)
-        width = width.unsqueeze(-1).clamp(1e-2) / 65
+        width = width.unsqueeze(-1).clamp(1e-2) / 33
 
         w = 0.3989422804014327
 
-        weight = w/width*torch.exp(-(weight-center)**2/(2*width**2))
+        weight = w / width * torch.exp(-(weight - center) ** 2 / (2 * width ** 2))
 
-        return weight/weight.max(dim=-1, keepdim=True)[0]
+        return weight / weight.max(dim=-1, keepdim=True)[0]
+    
     def forward(self,
                 key,
                 value,
@@ -184,8 +185,9 @@ class LorentzMultiHeadedAttention(nn.Module):
         attn = (2 +
                 2 * self.manifold.cinner(query, key)) / self.scale + self.bias
         if self.wid is not None:
-            gmm_mask = self.generate_gauss_weight(attn.shape[-1], self.wid)
-            gmm_mask = gmm_mask.unsqueeze(0).unsqueeze(0)
+            gmm_mask = self.generate_gauss_weight(
+                attn.shape[-1], self.wid, device=attn.device, dtype=attn.dtype
+            ).unsqueeze(0).unsqueeze(0)
             attn = attn * gmm_mask
         if mask is not None:
             mask = (1-mask).unsqueeze(1)  # [B, 1, 1, T_values]

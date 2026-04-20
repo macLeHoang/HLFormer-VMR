@@ -24,15 +24,21 @@ class HungarianMatcher(nn.Module):
     """
 
     def __init__(self, cost_class: float = 1.0, cost_span: float = 1.0,
-                 cost_giou: float = 1.0, max_v_l: int = 75):
+                 cost_giou: float = 1.0, max_v_l: int = 75,
+                 match_span_source: str = "coarse",
+                 refined_cost_weight: float = 0.5):
         super().__init__()
         self.cost_class = cost_class
         self.cost_span  = cost_span
         self.cost_giou  = cost_giou
         self.max_v_l    = max_v_l
+        self.match_span_source = match_span_source
+        self.refined_cost_weight = refined_cost_weight
         self.foreground_label = 0
         assert cost_class != 0 or cost_span != 0 or cost_giou != 0, \
             "At least one cost term must be non-zero"
+        assert self.match_span_source in {"coarse", "refined", "dual"}, \
+            "match_span_source must be 'coarse', 'refined', or 'dual'"
 
     @torch.no_grad()
     def forward(self, outputs, targets):
@@ -54,21 +60,46 @@ class HungarianMatcher(nn.Module):
         # Use sigmoid of the quality logit — pred_logits is now (B, Q) after
         # class_head was changed to Linear(H, 1).
         out_quality = outputs["pred_logits"].flatten(0, 1).sigmoid()            # (B*Q,)
-        out_spans   = outputs["pred_spans"].flatten(0, 1)                      # (B*Q, 2)
+        coarse_spans = outputs["pred_spans"].flatten(0, 1)                      # (B*Q, 2)
+        refined_spans = outputs.get("pred_spans_refined", None)
+        if refined_spans is not None:
+            refined_spans = refined_spans.flatten(0, 1)
 
         tgt_spans = torch.cat([t["spans"] for t in tgt_list], dim=0)          # (total_gt, 2)
 
         # Classification cost: -quality_score (higher quality = lower cost = preferred match)
         cost_class = -out_quality.unsqueeze(1).expand(-1, len(tgt_spans))     # (B*Q, total_gt)
 
-        # L1 span cost (in cxw format)
-        cost_span = torch.cdist(out_spans, tgt_spans, p=1)             # (B*Q, total_gt)
-
-        # GIoU cost (convert cxw -> xx first)
-        cost_giou = -generalized_temporal_iou(
-            span_cxw_to_xx(out_spans),
-            span_cxw_to_xx(tgt_spans)
-        )                                                               # (B*Q, total_gt)
+        # Span source selection for matching cost
+        if self.match_span_source == "refined" and refined_spans is not None:
+            match_spans = refined_spans
+            cost_span = torch.cdist(match_spans, tgt_spans, p=1)
+            cost_giou = -generalized_temporal_iou(
+                span_cxw_to_xx(match_spans),
+                span_cxw_to_xx(tgt_spans)
+            )
+        elif self.match_span_source == "dual" and refined_spans is not None:
+            cost_span_coarse = torch.cdist(coarse_spans, tgt_spans, p=1)
+            cost_giou_coarse = -generalized_temporal_iou(
+                span_cxw_to_xx(coarse_spans),
+                span_cxw_to_xx(tgt_spans)
+            )
+            cost_span_refined = torch.cdist(refined_spans, tgt_spans, p=1)
+            cost_giou_refined = -generalized_temporal_iou(
+                span_cxw_to_xx(refined_spans),
+                span_cxw_to_xx(tgt_spans)
+            )
+            w = float(self.refined_cost_weight)
+            cost_span = (1.0 - w) * cost_span_coarse + w * cost_span_refined
+            cost_giou = (1.0 - w) * cost_giou_coarse + w * cost_giou_refined
+        else:
+            # coarse mode, or fallback when refined spans are unavailable (e.g., aux outputs)
+            match_spans = coarse_spans
+            cost_span = torch.cdist(match_spans, tgt_spans, p=1)
+            cost_giou = -generalized_temporal_iou(
+                span_cxw_to_xx(match_spans),
+                span_cxw_to_xx(tgt_spans)
+            )
 
         # Combined cost matrix
         C = (self.cost_class * cost_class
@@ -99,4 +130,6 @@ def build_matcher(cfg):
         cost_span=cfg["set_cost_span"],
         cost_giou=cfg["set_cost_giou"],
         max_v_l=cfg["max_v_l"],
+        match_span_source=cfg.get("match_span_source", "coarse"),
+        refined_cost_weight=cfg.get("refined_cost_weight", 0.5),
     )

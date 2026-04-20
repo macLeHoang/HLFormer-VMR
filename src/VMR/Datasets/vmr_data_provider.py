@@ -122,6 +122,7 @@ class VMRDataset(Dataset):
                              training and rescale GT windows accordingly.
         feat_mask_ratio: if > 0, randomly zero out this fraction of video clips.
         gt_jitter_frames: if > 0, jitter GT boundaries by up to this many frames.
+        use_tef:          append Temporal Endpoint Features (start/end in [0,1]).
     """
 
     def __init__(self, dset_name, data_path, v_feat_dirs, q_feat_dir,
@@ -131,7 +132,7 @@ class VMRDataset(Dataset):
                  load_labels=True, txt_drop_ratio=0.0, data_ratio=1.0,
                  v_feat_len_mode="max", q_feat_len_mode="min",
                  temporal_crop_ratio=0.0, feat_mask_ratio=0.0,
-                 gt_jitter_frames=0):
+                 gt_jitter_frames=0, use_tef=False):
 
         self.dset_name      = dset_name
         self.data_path      = data_path
@@ -155,6 +156,7 @@ class VMRDataset(Dataset):
         self.temporal_crop_ratio = temporal_crop_ratio
         self.feat_mask_ratio     = feat_mask_ratio
         self.gt_jitter_frames    = gt_jitter_frames
+        self.use_tef             = use_tef
 
         if "val" in data_path or "test" in data_path:
             assert txt_drop_ratio == 0.0, \
@@ -184,6 +186,12 @@ class VMRDataset(Dataset):
         model_inputs["query_feat"] = self._get_query_feat(meta["qid"])   # (L_q, D_q)
         model_inputs["video_feat"] = self._get_video_feat(meta["vid"])   # (L_v, D_v)
         ctx_l = len(model_inputs["video_feat"])                           # actual #clips
+
+        if self.use_tef:
+            tef_st = torch.arange(0, ctx_l, 1.0) / max(ctx_l, 1)
+            tef_ed = tef_st + 1.0 / max(ctx_l, 1)
+            tef = torch.stack([tef_st, tef_ed], dim=1)
+            model_inputs["video_feat"] = torch.cat([model_inputs["video_feat"], tef], dim=1)
 
         # --- Temporal crop augmentation (training only) ---
         # Randomly crop a contiguous sub-sequence containing the GT window,
@@ -451,13 +459,10 @@ class VMRDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 def make_collate_fn(max_v_l):
-    """Return a collate function that pads video features to exactly max_v_l.
+    """Return a collate function that pads each batch to its own max length.
 
-    HLFormerBlock.layer2 has output size == frame_len == max_v_l, so every
-    batch must present videos of exactly that length.  Padding to the batch
-    maximum (the default) produces shorter sequences when all videos in a
-    batch are shorter than max_v_l, which causes the shape mismatch:
-        RuntimeError: size of tensor a (L_actual) != tensor b (max_v_l)
+    Video features and saliency_all_labels are padded dynamically so their
+    temporal length always matches within a batch.
     """
     def vmr_collate_fn(batch):
         batch_meta = [e["meta"] for e in batch]
@@ -472,19 +477,15 @@ def make_collate_fn(max_v_l):
                 batched_data[k] = torch.LongTensor([e["model_inputs"][k] for e in batch])
 
             elif k == "saliency_all_labels":
-                # Pad to max_v_l so its length matches vid_mask / saliency_scores
-                arrays = [e["model_inputs"][k] for e in batch]
-                padded = np.zeros((len(arrays), max_v_l), dtype=np.float32)
-                for i, a in enumerate(arrays):
-                    length = min(len(a), max_v_l)
-                    padded[i, :length] = a[:length]
-                batched_data[k] = torch.tensor(padded, dtype=torch.float32)
+                padded, _ = pad_sequences_1d(
+                    [e["model_inputs"][k] for e in batch],
+                    dtype=torch.float32, fixed_length=None)
+                batched_data[k] = padded
 
             elif k == "video_feat":
-                # Pad to max_v_l so HLFormerBlock always receives frame_len clips
                 padded, mask = pad_sequences_1d(
                     [e["model_inputs"][k] for e in batch],
-                    dtype=torch.float32, fixed_length=max_v_l)
+                    dtype=torch.float32, fixed_length=None)
                 batched_data[k] = (padded, mask)
 
             elif k == "query_feat":
@@ -562,6 +563,7 @@ def build_vmr_dataloaders(cfg):
         normalize_t      = cfg.get("normalize_t", True),
         v_feat_len_mode  = cfg.get("v_feat_len_mode", "max"),
         q_feat_len_mode  = cfg.get("q_feat_len_mode", "min"),
+        use_tef          = cfg.get("use_tef", False),
     )
 
     train_dset = VMRDataset(

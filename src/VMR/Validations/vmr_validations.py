@@ -356,9 +356,23 @@ def evaluate_vmr(model, dataloader, device, cfg):
         metrics[f"mAP@{thr}"] = compute_map(all_preds, all_gt, iou_thresh=thr)
 
     if all_saliency_scores:
-        sal_scores = torch.cat(all_saliency_scores, dim=0)
-        sal_labels = np.concatenate(all_saliency_labels, axis=0)
-        sal_masks  = torch.cat(all_vid_masks, dim=0)
+        max_l = max(s.shape[1] for s in all_saliency_scores)
+
+        def _pad_t(t, pad_value=0.0):
+            if t.shape[1] == max_l:
+                return t
+            pad = t.new_full((t.shape[0], max_l - t.shape[1]), pad_value)
+            return torch.cat([t, pad], dim=1)
+
+        def _pad_np(a, pad_value=0.0):
+            if a.shape[1] == max_l:
+                return a
+            pad = np.full((a.shape[0], max_l - a.shape[1]), pad_value, dtype=a.dtype)
+            return np.concatenate([a, pad], axis=1)
+
+        sal_scores = torch.cat([_pad_t(s, pad_value=0.0) for s in all_saliency_scores], dim=0)
+        sal_labels = np.concatenate([_pad_np(a, pad_value=0.0) for a in all_saliency_labels], axis=0)
+        sal_masks  = torch.cat([_pad_t(m, pad_value=0.0) for m in all_vid_masks], dim=0)
         metrics["hl_mAP"] = compute_highlight_map(sal_scores, sal_labels, sal_masks)
         metrics["HIT@1"]  = compute_hit1(sal_scores, sal_labels, sal_masks)
 

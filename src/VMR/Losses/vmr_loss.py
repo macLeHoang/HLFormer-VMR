@@ -129,7 +129,8 @@ class VMRSetCriterion(nn.Module):
                  saliency_margin=1.0, use_matcher=True,
                  use_hyperbolic=False, loss_pop_coef=1e-3,
                  temperature=0.07, label_smoothing=0.0,
-                 alpha_iou_alpha=2.0):
+                 alpha_iou_alpha=2.0,
+                 label_span_source="coarse"):
         super().__init__()
         self.matcher         = matcher
         self.weight_dict     = weight_dict
@@ -141,6 +142,9 @@ class VMRSetCriterion(nn.Module):
         self.temperature     = temperature
         self.label_smoothing = label_smoothing
         self.alpha_iou_alpha = alpha_iou_alpha   # exponent for Alpha-IoU in refiner head
+        self.label_span_source = label_span_source
+        assert self.label_span_source in {"coarse", "refined", "matched"}, \
+            "label_span_source must be 'coarse', 'refined', or 'matched'"
 
         # Class weights: foreground=1.0, background=eos_coef
         empty_weight = torch.ones(2)
@@ -182,49 +186,48 @@ class VMRSetCriterion(nn.Module):
         # zone that separates R1@0.5 hits from R1@0.7 hits.
         # v34: 0.5/0.5 → 0.3/0.7 — put 70% of gradient budget on Alpha-IoU to
         # maximise signal in the 0.5→0.7 IoU transition region (R1@0.7 bottleneck).
-        loss_giou_combined = 0.3 * loss_diou + 0.7 * loss_alpha
+        loss_giou_combined = 0.5 * loss_diou + 0.5 * loss_alpha
 
         return {"loss_span": loss_l1, "loss_giou": loss_giou_combined, "loss_boundary": loss_boundary}
 
     def loss_contrastive_align(self, outputs, targets, indices, log=True):
-        """Cross-sample NCE loss aligning matched query slots with text representations.
+        """QD-DETR style contrastive alignment loss.
 
-        For each matched (query_b, text_b) pair, maximises similarity to text_b
-        and minimises similarity to all other texts in the batch.
-
-        The previous fg-only logsumexp was broken: all matched queries within the
-        same sample share the same text mean, so all fg_logits are equal → the
-        loss degenerates to log(N_matched) = constant, giving zero useful gradient.
-        Cross-sample NCE fixes this by making each query compete against all B texts.
+        Computes query-token similarities, sums over text tokens to get
+        per-query logits, then applies positive-map NCE using matched queries.
         """
         if "proj_queries" not in outputs:
             return {"loss_contrastive_align": torch.tensor(0.0,
                     device=outputs["pred_spans"].device)}
-
-        proj_queries = outputs["proj_queries"]   # (B, Q, hdim)
-        proj_txt     = outputs["proj_txt_mem"]   # (B, L_t, hdim)
-
-        idx             = self._src_permutation_idx(indices)
-        matched_queries = proj_queries[idx]      # (#matched, hdim)
-        batch_ids       = idx[0].to(proj_queries.device)  # (#matched,) — sample index for each matched query
-
-        if matched_queries.numel() == 0:
+        if indices is None:
             return {"loss_contrastive_align": torch.tensor(0.0,
                     device=outputs["pred_spans"].device)}
 
-        # Per-sample text representation: mean over token dim, then re-normalize.
-        # L2-renormalization after averaging keeps cosine similarity well-scaled.
-        txt_rep = proj_txt.mean(dim=1)               # (B, hdim)
-        txt_rep = F.normalize(txt_rep, p=2, dim=-1)  # (B, hdim)
+        normalized_text_embed = outputs["proj_txt_mem"]   # (B, L_t, d)
+        normalized_img_embed  = outputs["proj_queries"]   # (B, Q, d)
 
-        # Cross-sample similarity matrix: (#matched, B)
-        # Each matched query should be closest to its own sample's text.
-        cross_logits = torch.matmul(matched_queries, txt_rep.t()) / self.temperature
+        logits = torch.einsum(
+            "bmd,bnd->bmn", normalized_img_embed, normalized_text_embed
+        )
+        logits = logits.sum(2) / self.temperature          # (B, Q)
 
-        # Standard InfoNCE / cross-entropy: positive = own-sample text index
-        loss_nce = F.cross_entropy(cross_logits, batch_ids)
+        idx = self._src_permutation_idx(indices)
+        positive_map = torch.zeros_like(logits, dtype=torch.bool)
+        if idx[0].numel() > 0:
+            positive_map[idx] = True
 
-        return {"loss_contrastive_align": loss_nce}
+        num_pos = positive_map.sum(1)                      # (B,)
+        valid = num_pos > 0
+        if not valid.any():
+            return {"loss_contrastive_align": torch.tensor(0.0,
+                    device=outputs["pred_spans"].device)}
+
+        positive_logits = logits.masked_fill(~positive_map, 0.0)
+        pos_term = positive_logits.sum(1)
+        neg_term = logits.logsumexp(1)
+
+        loss_nce = -pos_term[valid] / num_pos[valid].float() + neg_term[valid]
+        return {"loss_contrastive_align": loss_nce.mean()}
 
     def loss_labels(self, outputs, targets, indices, log=True):
         """Quality score loss: train fg logit to predict IoU-with-GT.
@@ -245,18 +248,23 @@ class VMRSetCriterion(nn.Module):
 
         # Compute actual IoU for each matched (pred, gt) pair — no gradient
         with torch.no_grad():
-            src_spans = span_cxw_to_xx(outputs["pred_spans"][idx])        # (#matched, 2)
+            use_refined_for_labels = False
+            if self.label_span_source == "refined":
+                use_refined_for_labels = True
+            elif self.label_span_source == "matched":
+                matcher_source = getattr(self.matcher, "match_span_source", "coarse")
+                use_refined_for_labels = matcher_source in {"refined", "dual"}
+
+            span_key = "pred_spans_refined" if (
+                use_refined_for_labels and outputs.get("pred_spans_refined") is not None
+            ) else "pred_spans"
+
+            src_spans = span_cxw_to_xx(outputs[span_key][idx])            # (#matched, 2)
             tgt_spans = span_cxw_to_xx(
                 torch.cat(
                     [t["spans"][j] for t, (_, j) in zip(targets["span_labels"], indices)],
                     dim=0))                                                 # (#matched, 2)
             iou_mat, _ = temporal_iou(src_spans, tgt_spans)
-            # Scale IoU to [0.5, 1.0] for matched predictions:
-            #   IoU=0.0 -> target=0.50  (always above the 0/1 threshold → no saturation)
-            #   IoU=0.5 -> target=0.75
-            #   IoU=1.0 -> target=1.00
-            # This guarantees matched slots always get a positive signal above 0.5,
-            # while unmatched slots stay at 0.0 — clear separation from the start.
             raw_iou   = torch.diag(iou_mat).clamp(0.0, 1.0)               # (#matched,)
             # Use raw IoU directly with a floor of 0.1.
             # The old formula (0.5 + 0.5 * raw_iou) set a floor of 0.5, which
@@ -657,5 +665,6 @@ def build_criterion(cfg):
         temperature    = cfg.get("temperature", 0.07),
         label_smoothing= cfg.get("label_smoothing", 0.0),
         alpha_iou_alpha= cfg.get("alpha_iou_alpha", 2.0),
+        label_span_source=cfg.get("label_span_source", "coarse"),
     )
     return criterion

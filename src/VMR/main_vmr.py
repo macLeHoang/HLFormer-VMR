@@ -284,6 +284,48 @@ def apply_loss_schedule(epoch, criterion, cfg, logger=None):
 
 
 # ---------------------------------------------------------------------------
+# Augmentation schedule
+# ---------------------------------------------------------------------------
+
+def apply_augmentation_schedule(epoch, train_loader, cfg, logger=None):
+    """Patch training dataset augmentation strengths at phase boundaries."""
+    schedule = cfg.get("aug_schedule")
+    if not schedule:
+        return
+
+    def _active_phase(ep):
+        active = None
+        active_start = -1
+        for (from_epoch, params) in schedule:
+            if ep >= from_epoch >= active_start:
+                active = params
+                active_start = from_epoch
+        return active, active_start
+
+    current_phase, current_start = _active_phase(epoch)
+    prev_phase, prev_start = _active_phase(epoch - 1)
+
+    if current_phase is None:
+        return
+    if current_start == prev_start and epoch > 0:
+        return
+
+    train_dset = getattr(train_loader, "dataset", None)
+    if train_dset is None:
+        return
+
+    applied = []
+    for key, val in current_phase.items():
+        if hasattr(train_dset, key):
+            setattr(train_dset, key, val)
+            cfg[key] = val
+            applied.append(f"{key}={val}")
+
+    if logger and applied:
+        logger.info(f"  [AugSchedule] Epoch {epoch}: phase from_epoch={current_start}  " + "  ".join(applied))
+
+
+# ---------------------------------------------------------------------------
 # One training epoch
 # ---------------------------------------------------------------------------
 
@@ -400,7 +442,7 @@ def main():
     # ---------- Checkpoint resume ---------------------------------------------
     current_epoch      = -1
     best_metrics       = {"primary": 0.0}
-    best_sal_metrics   = {"hl_mAP": 0.0}
+    # best_sal_metrics   = {"hl_mAP": 0.0}
     optimizer          = build_optimizer(model, cfg)
     scheduler       = build_scheduler(optimizer, cfg)
 
@@ -454,6 +496,9 @@ def main():
 
         # --- Loss schedule (phase-boundary updates to criterion/matcher) ---
         apply_loss_schedule(epoch, criterion, cfg, logger)
+
+        # --- Augmentation schedule (phase-boundary updates to train dataset) ---
+        apply_augmentation_schedule(epoch, train_loader, cfg, logger)
 
         # --- Train ---
         train_loss, loss_components = train_one_epoch(

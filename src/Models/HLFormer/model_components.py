@@ -44,7 +44,7 @@ class clip_nce(nn.Module):
         if self.reduction:
             return torch.mean(t2v_denominator - t2v_nominator) + torch.mean(v2t_denominator - v2t_nominator)
         else:
-            return denominator - nominator
+            return t2v_denominator - t2v_nominator
 
 
 class frame_nce(nn.Module):
@@ -127,69 +127,80 @@ class HLFormerBlock(nn.Module):
     def __init__(self, config,manifold):
         super(HLFormerBlock, self).__init__()
 
+        if config.attention_num % 2 != 0:
+            raise ValueError(f"attention_num must be even, got {config.attention_num}")
         self.num_block = int (config.attention_num//2)-1
         self.e_attns = nn.ModuleList()
-        # self.e_attns.append(EuclideanAttentionBlock(config))
-        # for i in range(1,self.num_block+1):
-        #     wid = 2 ** (i + 2) 
-        #     self.e_attns.append(EuclideanAttentionBlock(config, wid=wid))
-
-        for i in range(0, self.num_block+1):
-            wid = 2 ** (i + 3) 
+        self.e_attns.append(EuclideanAttentionBlock(config))
+        for i in range(1, self.num_block+1):
+            wid = 2 ** (i + 2) 
             self.e_attns.append(EuclideanAttentionBlock(config, wid=wid))
 
         self.h_attns = nn.ModuleList()
-        # self.h_attns.append(LorentzAttentionBlock(config,manifold=manifold))
-        # for i in range(1,self.num_block+1):
-        #     wid = 2 ** (i + 2) 
-        #     self.h_attns.append(LorentzAttentionBlock(config,manifold=manifold, wid=wid))
-
-        for i in range(0, self.num_block+1):
-            wid = 2 ** (i + 3) 
+        self.h_attns.append(LorentzAttentionBlock(config,manifold=manifold))
+        for i in range(1, self.num_block+1):
+            wid = 2 ** (i + 2) 
             self.h_attns.append(LorentzAttentionBlock(config,manifold=manifold, wid=wid))
-
 
         self.ca = CrossAttention(config)
         self.layer1 = nn.Linear(config.hidden_size, config.hidden_size)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.layer2 = nn.Linear(config.hidden_size, config.frame_len)
+        self.layer2 = nn.Linear(config.hidden_size, 1)
 
         self.sft_factor = config.sft_factor
+        self.branch_norm = nn.LayerNorm(config.hidden_size)
+        self.weight_token_mode = getattr(config, "weight_token_mode", "global")
+        _hybrid_init = float(getattr(config, "weight_token_hybrid_init", 0.7))
+        _hybrid_init = min(max(_hybrid_init, 1e-4), 1 - 1e-4)
+        self.weight_token_hybrid_logit = nn.Parameter(
+            torch.tensor(math.log(_hybrid_init / (1.0 - _hybrid_init)), dtype=torch.float32)
+        )
 
     def forward(self, input_tensor, attention_mask=None, weight_token=None):
 
         outputs = []
         for i in range(len(self.e_attns)):
-            o = self.e_attns[i](input_tensor, attention_mask).unsqueeze(-1)
-            outputs.append(o) 
-        for i in range(len(self.h_attns)):  
-            o = self.h_attns[i](input_tensor, attention_mask).unsqueeze(-1)
-            outputs.append(o) 
+            o = self.branch_norm(self.e_attns[i](input_tensor, attention_mask)).unsqueeze(-1)
+            outputs.append(o)
+        for i in range(len(self.h_attns)):
+            o = self.branch_norm(self.h_attns[i](input_tensor, attention_mask)).unsqueeze(-1)
+            outputs.append(o)
         oo = torch.cat(outputs, dim=-1)
 
-
-        if weight_token is None:
-            mean_oo = torch.mean(oo, dim=-1)#.squeeze())
-            weight_token =torch.mean(mean_oo,dim=1,keepdim=True)
-
+        B, L, H, K = oo.shape
+        if attention_mask is not None:
+            valid = attention_mask.squeeze(1).type_as(oo)
+            denom = valid.sum(dim=1, keepdim=True).clamp(min=1.0)
+            mean_token = (oo.mean(dim=-1) * valid.unsqueeze(-1)).sum(dim=1, keepdim=True) / denom.unsqueeze(-1)
         else:
-            weight_token = weight_token.to(oo.device).type_as(oo)
-            if weight_token.shape[0] != oo.shape[0]:
-                # single shared token (1, 1, H) → expand to (B, 1, H)
-                weight_token = weight_token.expand(oo.shape[0], -1, -1)
-            # weight_token = weight_token.to(oo.device).type_as(oo).repeat(oo.shape[0], 1, 1)
-        weight = []
-        for i in range(oo.shape[-1]):
-            temp_token = self.ca(weight_token, oo[..., i], attention_mask)
-            weight.append(temp_token)
+            mean_token = oo.mean(dim=-1).mean(dim=1, keepdim=True)
 
-        weight = torch.cat(weight, dim=1)    
+        if weight_token is not None:
+            global_token = weight_token.to(oo.device).type_as(oo)
+            if global_token.shape[0] != B:
+                global_token = global_token.expand(B, -1, -1)
+        else:
+            global_token = mean_token
+
+        if self.weight_token_mode == "mean":
+            selected_token = mean_token
+        elif self.weight_token_mode == "hybrid":
+            gate = torch.sigmoid(self.weight_token_hybrid_logit)
+            selected_token = gate * global_token + (1.0 - gate) * mean_token
+        else:
+            selected_token = global_token
+
+        branch_feat = oo.permute(0, 3, 1, 2).reshape(B * K, L, H)
+        query_token = selected_token.repeat_interleave(K, dim=0)
+        branch_mask = attention_mask.repeat_interleave(K, dim=0) if attention_mask is not None else None
+        weight = self.ca(query_token, branch_feat, branch_mask).view(B, K, H)
+
         weight = self.layer1(weight)
         weight = self.dropout(F.relu(weight))
-        weight = self.layer2(weight)
-        
-        weight = F.softmax(weight.permute(0, 2, 1) / self.sft_factor, dim=-1)
-        out = torch.sum(oo * weight.unsqueeze(2).repeat(1, 1, oo.shape[2], 1), dim=-1)
+        weight = self.layer2(weight).squeeze(-1)
+
+        weight = F.softmax(weight / self.sft_factor, dim=-1)
+        out = torch.sum(oo * weight[:, None, None, :], dim=-1)
 
         return out
 
@@ -275,27 +286,29 @@ class EuclideanGaussianAttention(nn.Module):
         self.value = nn.Linear(config.hidden_size, self.all_head_size)
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.wid = wid
-        
+        self._gauss_cache = {}
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)  # (N, L, nh, dh)
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)  # (N, nh, L, dh)
 
-    def generate_gauss_weight(self, props_len, width):
+    def generate_gauss_weight(self, props_len, width, device, dtype):
+        cache_key = (props_len, float(width), str(device), str(dtype))
+        if cache_key in self._gauss_cache:
+            return self._gauss_cache[cache_key]
 
-        center = torch.arange(props_len).cuda() / props_len
-        width = width*torch.ones(props_len).cuda()
-        weight = torch.linspace(0, 1, props_len)
-        weight = weight.view(1, -1).expand(center.size(0), -1).to(center.device)
+        center = torch.arange(props_len, device=device, dtype=dtype) / props_len
+        width_t = (width * torch.ones(props_len, device=device, dtype=dtype)).unsqueeze(-1).clamp(1e-2) / 33
+        weight = torch.linspace(0, 1, props_len, device=device, dtype=dtype)
+        weight = weight.view(1, -1).expand(center.size(0), -1)
         center = center.unsqueeze(-1)
-        width = width.unsqueeze(-1).clamp(1e-2) / 65
 
         w = 0.3989422804014327
-
-        weight = w/width*torch.exp(-(weight-center)**2/(2*width**2))
-
-        return weight/weight.max(dim=-1, keepdim=True)[0]
+        gauss = w / width_t * torch.exp(-(weight - center) ** 2 / (2 * width_t ** 2))
+        gauss = gauss / gauss.max(dim=-1, keepdim=True)[0]
+        self._gauss_cache[cache_key] = gauss
+        return gauss
 
     def forward(self, query_states, key_states, value_states, attention_mask=None):
         """
@@ -320,8 +333,11 @@ class EuclideanGaussianAttention(nn.Module):
 
         attention_scores = attention_scores_ori
         if self.wid is not None:
-            gmm_mask = self.generate_gauss_weight(attention_scores.shape[-1], self.wid)
-            gmm_mask = gmm_mask.unsqueeze(0).unsqueeze(0)
+            gmm_mask = self.generate_gauss_weight(
+                attention_scores.shape[-1], self.wid,
+                device=attention_scores.device,
+                dtype=attention_scores.dtype,
+            ).unsqueeze(0).unsqueeze(0)
             attention_scores = attention_scores_ori * gmm_mask
         # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
         if attention_mask is not None:
@@ -354,14 +370,14 @@ class LorentzSelfAttention(nn.Module):
     def forward(self,x,attention_mask=None):
         x = self.input_proj(x)
 
-        self.scale_alpha.data = torch.clamp(self.scale_alpha.data,max=0.)
-        x = x*self.scale_alpha.exp()
+        scale = self.scale_alpha.clamp(max=0.).exp()
+        x = x * scale
 
         x = F.pad(x, pad=(1,0), value=0)
         x = self.manifold.expmap0(x)
         x = self.lorentz_multiattention(x,x,x,attention_mask)
         x = self.manifold.logmap0(x)[:,:,1:]
-        x = x/self.scale_alpha.exp()
+        x = x / scale
         output = self.output_proj(x)
         return output
 

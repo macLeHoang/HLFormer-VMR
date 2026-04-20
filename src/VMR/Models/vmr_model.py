@@ -423,6 +423,7 @@ class BoundaryRefinementHead(nn.Module):
         self.max_delta        = max_delta
         self.learnable_sigma  = learnable_sigma
         self._H               = H
+        self._sigma_ref_len   = float(max_v_l)
         # Base Gaussian sigma per boundary in normalized [0,1] space.
         # Initialised so sigma ≈ window_frames / (2 * max_v_l).
         init_log_sigma = math.log(max(window_frames / (2.0 * max_v_l), 1e-6))
@@ -479,8 +480,9 @@ class BoundaryRefinementHead(nn.Module):
         log_sigma_e = (self.log_sigma_end
                        + self.sigma_width_scale_end   * width
                        + txt_off_e)                              # (B, Q)
-        sigma_s = log_sigma_s.exp().clamp(min=min_sig)           # (B, Q)
-        sigma_e = log_sigma_e.exp().clamp(min=min_sig)           # (B, Q)
+        # len_scale = self._sigma_ref_len / float(L)
+        sigma_s = (log_sigma_s.exp()).clamp(min=min_sig)           # (B, Q)
+        sigma_e = (log_sigma_e.exp()).clamp(min=min_sig)           # (B, Q)
 
         def _pool(anchor, sigma):
             # anchor: (B, Q), sigma: (B, Q), returns (B, Q, H)
@@ -620,7 +622,9 @@ class HLFormer_VMR(nn.Module):
             sft_factor=config.sft_factor,
             drop=config.drop,
             lorentz_dim=config.lorentz_dim,
-            attention_num=config.attention_num)
+            attention_num=config.attention_num,
+            weight_token_mode=getattr(config, "weight_token_mode", "global"),
+            weight_token_hybrid_init=getattr(config, "weight_token_hybrid_init", 0.7))
         self.video_encoder = HLFormerBlock(vid_enc_cfg, manifold=self.manifold)
 
         # ---- Decoder (iterative reference-point refinement) ------------
@@ -788,8 +792,6 @@ class HLFormer_VMR(nn.Module):
         # Prepend global token: [global | video]
         g = (self.global_token + self.global_pos).reshape(1, 1, H).expand(B, 1, H)
         vid_with_g = torch.cat([g, vid_feat], dim=1)            # (B, 1+L_v, H)
-        g_mask     = torch.ones(B, 1, dtype=vid_mask.dtype, device=vid_mask.device)
-        mask_g     = torch.cat([g_mask, vid_mask], dim=1)       # (B, 1+L_v)
 
         # txt_kpm: True where text is padded — passed as key_padding_mask so
         # PyTorch MHA suppresses padded text keys in cross-attention.
@@ -881,6 +883,13 @@ class HLFormer_VMR(nn.Module):
         H        = self.config.hidden_size
         aux_loss = getattr(self.config, "aux_loss", False)
 
+        expected_vid_dim = sum(getattr(self.config, "v_feat_dims", [self.config.v_feat_dim]))
+        if src_vid.shape[-1] != expected_vid_dim:
+            raise ValueError(
+                f"src_vid feature dim mismatch: got {src_vid.shape[-1]}, expected {expected_vid_dim}. "
+                f"Check v_feat_dims/v_feat_dim and use_tef config alignment."
+            )
+
         # ---- 1. Encode text ------------------------------------------
         txt_feat = self._encode_query(src_txt, src_txt_mask)    # (B, L_t, H)
 
@@ -954,11 +963,14 @@ class HLFormer_VMR(nn.Module):
         #  conflicting gradients between positive and negative text encoder updates.
         #  vid_feat is detached so the negative-pair gradient only updates
         #  the text encoder and saliency projections.
-        txt_neg_feat = torch.cat([txt_feat[1:], txt_feat[:1]], dim=0)       # (B, L_t, H)
-        txt_neg_mask = torch.cat([src_txt_mask[1:], src_txt_mask[:1]], dim=0)
-        txt_neg_valid = txt_neg_mask.unsqueeze(-1).float()                  # (B, L_t, 1)
-        global_rep_neg = (txt_neg_feat * txt_neg_valid).sum(1) / \
-                         txt_neg_valid.sum(1).clamp(min=1.0)                # (B, H)
+        if txt_feat.shape[0] > 1:
+            txt_neg_feat = torch.cat([txt_feat[1:], txt_feat[:1]], dim=0)       # (B, L_t, H)
+            txt_neg_mask = torch.cat([src_txt_mask[1:], src_txt_mask[:1]], dim=0)
+            txt_neg_valid = txt_neg_mask.unsqueeze(-1).float()                  # (B, L_t, 1)
+            global_rep_neg = (txt_neg_feat * txt_neg_valid).sum(1) / \
+                             txt_neg_valid.sum(1).clamp(min=1.0)                # (B, H)
+        else:
+            global_rep_neg = global_rep.detach()
 
         saliency_scores_neg = (
             self.saliency_proj1(vid_feat.detach())
@@ -1070,4 +1082,12 @@ class HLFormer_VMR(nn.Module):
 
 def build_model(cfg):
     """Build HLFormer_VMR from a config dict."""
+    cfg = dict(cfg)
+    if cfg.get("use_tef", False):
+        stream_dims = cfg.get("v_feat_dims", None)
+        if stream_dims is not None and len(stream_dims) == len(cfg.get("v_feat_dirs", [])):
+            cfg["v_feat_dims"] = list(stream_dims) + [2]
+            cfg["v_feat_dim"] = sum(cfg["v_feat_dims"])
+        else:
+            cfg["v_feat_dim"] = cfg.get("v_feat_dim", 0) + 2
     return HLFormer_VMR(edict(cfg))

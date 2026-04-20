@@ -51,6 +51,7 @@ cfg["txt_drop_ratio"] = 0.0
 cfg["data_ratio"]   = 1.0
 cfg["v_feat_len_mode"] = "max"   # "max": resample to longest | "min": truncate to shortest
 cfg["q_feat_len_mode"] = "min"   # "min": truncate (safe default for discrete token embeds)
+cfg["use_tef"]        = False
 
 # ---- Model architecture --------------------------------------------------
 cfg["hidden_size"]    = 256

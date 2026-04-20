@@ -15,7 +15,7 @@ cfg = dict(_qvh.cfg)   # inherit defaults, then override
 
 cfg["seed"]          = 2026
 
-cfg["model_name"]    = "HLFormer_VMR_SFCB_v36"   # v36: text+width conditioned sigma in BoundaryRefinementHead, max_delta=0.15, loss cap at 6.0
+cfg["model_name"]    = "HLFormer_VMR_SFCB_v39"   # v37: align matcher/label span source with refined spans + increase query capacity
 cfg["dataset_name"]  = "charades_sta"
 cfg["dset_name"]     = "charades_sta"
 
@@ -45,25 +45,36 @@ cfg["t_feat_dim"]  = sum(cfg["t_feat_dims"])     # 1280
 
 cfg["max_v_l"]     = 75
 cfg["clip_len"]    = 1.0
+cfg["use_tef"]     = True
+cfg["v_feat_len_mode"] = "max" 
 
 # ---- Model architecture --------------------------------------------------
 cfg["hidden_size"]    = 384   # v30: restored to 384; v28=320 hit capacity ceiling
-cfg["n_heads"]        = 8     # 384/8=48 per head
-cfg["num_queries"]    = 5     # v34: restored to 10; more candidates give Hungarian matcher better options
+cfg["n_heads"]        = 6     # 384/8=48 per head
+cfg["num_queries"]    = 10    # v37: increase proposal capacity for better candidate coverage
 cfg["dec_layers"]     = 4     # v33: 6→4; fewer aux layers reduces gradient interference on 1-GT dataset
 cfg["input_drop"]     = 0.25   # v33: 0.35→0.2; heavy dropout was preventing fine boundary learning
 cfg["drop"]           = 0.15  # v33: 0.3→0.15; reduce regularization — plateau is generalization, not overfit
 cfg["txt_drop_ratio"] = 0.1   # v33: 0.15→0.1; lighter text dropout
 cfg["t2v_layers"]     = 4    # v17→v18: deeper cross-modal fusion for richer global_rep
-cfg["attention_num"]  = 8
+cfg["attention_num"]  = 6
 cfg["pos_enc_type"]   = "trainable"
 cfg["sft_factor"]     = 0.1   # v11=0.06; stronger query-conditioned feature shift
+cfg["weight_token_mode"] = "hybrid"       # global | mean | hybrid
+cfg["weight_token_hybrid_init"] = 0.7      # gate on global token at init
 
 # v11=False; enabling text-in-memory makes encoder query-conditioned (not just decoder)
 cfg["use_txt_in_memory"]     = True
 cfg["use_global_in_encoder"] = True
 
 cfg["use_refined_spans"] = True
+
+# ---- v37 alignment flags ---------------------------------------------------
+# Match and quality-target supervision should follow the same span space used
+# at evaluation time (refined when available), with safe fallback to coarse.
+cfg["match_span_source"]   = "refined"   # coarse | refined | dual
+cfg["refined_cost_weight"] = 0.5         # used only when match_span_source="dual"
+cfg["label_span_source"]   = "matched"   # coarse | refined | matched
 
 # ---- Hyperbolic entailment -----------------------------------------------
 # v14 enhancements:
@@ -103,21 +114,19 @@ cfg["boundary_loss_coef"] = 0.0   # disabled: smooth-L1 on (start,end) is redund
                                    # value of 16.0 was swamping the DIoU gradient 16:1.
                                    # Boundary supervision is kept in the refinement head.
 cfg["label_loss_coef"]    = 2.0   # v33: 4.0→2.0; quality head converges fast, reduce dominance over span losses
-cfg["label_smoothing"]    = 0.2  # v32: 0.1→0.2; softer targets reduce overconfident predictions
+# cfg["label_smoothing"]    = 0.1  # v32: 0.1→0.2; softer targets reduce overconfident predictions
 
 # ---- Boundary refinement losses (BoundaryRefinementHead, v15) -----------
 # Applied to pred_spans_refined (final layer only, same Hungarian indices).
 # v31: enabled from epoch 0 — the BoundaryRefineHead is zero-initialized so it
 # starts as identity and gradually activates.  With giou_coef=4.0 the model gets
 # direct boundary supervision from the beginning.
-cfg["boundary_refine_coef"]           = 4.0   # v34: 1.0→4.0; start at high weight from ep0 — zero-init
-                                               # guarantees identity at start, so high weight is safe.
-                                               # Evaluation uses pred_spans_refined, so this loss must be strong.
-cfg["boundary_refine_giou_coef"]      = 4.0   # v34: same rationale as boundary_refine_coef
-cfg["boundary_refine_window"]         = 12     # v34: at max_v_l=77, sigma=16/154≈0.10 (10% of video); tight enough for precise boundary pooling
+cfg["boundary_refine_coef"]           = 1.0   # phase-0 default; schedule ramps refinement gradually.
+cfg["boundary_refine_giou_coef"]      = 1.0
+cfg["boundary_refine_window"]         = 16     # v34: at max_v_l=77, sigma=16/154≈0.10 (10% of video); tight enough for precise boundary pooling
 cfg["boundary_refine_learnable_sigma"] = True
-cfg["boundary_refine_max_delta"]      = 0.15  # v36: 0.25→0.15; tighter cap, still ±11 frames at L=75
-cfg["alpha_iou_alpha"]                = 3.0   # v34: 2.5→3.0; stronger gradient amplification in 0.5-0.7 IoU zone
+cfg["boundary_refine_max_delta"]      = 0.2  # v36: 0.25→0.15; tighter cap, still ±11 frames at L=75
+cfg["alpha_iou_alpha"]                = 2.0   # v34: 2.5→3.0; stronger gradient amplification in 0.5-0.7 IoU zone
 
 # aux_loss_scale starts low: early decoder layers produce near-zero IoU targets,
 # creating a strong "everything is background" pull if aux losses are weighted heavily.
@@ -132,9 +141,8 @@ cfg["set_cost_span"]   = 10.0  # v17→v18: match span_loss_coef ratio
 cfg["set_cost_giou"]   = 2.0   # v31: was 1.0; IoU-aware matching from start
 
 # ---- Post-processing -----------------------------------------------------
-cfg["top_k"]      = 5   # v34: must match num_queries=10; keep all predictions as NMS candidates
-cfg["nms_thresh"] = 0.5  # v32: 0.3→0.5; more lenient NMS — R1 only cares about the top-1 prediction,
-                          # tight NMS was removing good predictions that overlapped with slightly worse ones
+cfg["top_k"]      = 10  # keep all query candidates before NMS (matches num_queries)
+cfg["nms_thresh"] = 0.6  # looser NMS to preserve near-duplicate high-IoU candidates for top-1 selection
 
 # ---- Optimizer -----------------------------------------------------------
 cfg["lr"]            = 1.5e-4  # v34: 1e-4→2e-4; stronger gradient signal, more budget before cosine trough
@@ -152,7 +160,7 @@ cfg["grad_clip"]     = 0.3
 cfg["use_ema"]       = True   # v32: NEW; exponential moving average smooths val fluctuations (+1-2 R1)
 cfg["ema_decay"]     = 0.999  # v34: 0.999→0.9995; EMA tracks current model more closely during active learning
 cfg["n_epoch"]       = 100
-cfg["max_es_cnt"]    = 50     # v17→v18: give more room after LR drop
+cfg["max_es_cnt"]    = 20     # v17→v18: give more room after LR drop
 cfg["batchsize"]     = 32
 
 # ---- DataLoader ----------------------------------------------------------
@@ -161,8 +169,30 @@ cfg["num_workers"] = 2
 # ---- Data augmentation (training only) -----------------------------------
 cfg["temporal_crop_ratio"] = 0.2   # v32: randomly crop 20% of video, forces context-invariant localization
 cfg["feat_mask_ratio"]     = 0.15  # v32: randomly mask 15% of clips, prevents reliance on specific frames
-cfg["gt_jitter_frames"]    = 2     # v32: jitter GT boundaries ±2 frames, smooths supervision signal
+cfg["gt_jitter_frames"]    = 2  # v32: jitter GT boundaries ±2 frames, smooths supervision signal
 cfg["feat_noise_std"]      = 0.0  # v32: Gaussian noise σ added to projected features during training
+
+# Epoch-wise augmentation schedule (train only).
+# Each entry updates train_dset augmentation strengths from `from_epoch` onward.
+cfg["aug_schedule"] = [
+    (0, {
+        "temporal_crop_ratio": 0.2,
+        "feat_mask_ratio":     0.15,
+        "gt_jitter_frames":    2,
+    }),
+    (30, {
+        "temporal_crop_ratio": 0.1,
+        "feat_mask_ratio":     0.1,
+        "gt_jitter_frames":    1,
+    }),
+    (45, {
+        "temporal_crop_ratio": 0.05,
+        "feat_mask_ratio":     0.05,
+        "gt_jitter_frames":    0,
+    }),
+]
+
+cfg["iou_thresholds"] = [0.3, 0.5, 0.7]
 
 # ---- Loss schedule -------------------------------------------------------
 # Each entry: (from_epoch, {cfg_key: new_value, ...})
@@ -195,36 +225,86 @@ cfg["loss_schedule"] = [
         "set_cost_giou":               2.0,
     }),
     (15, {
-        "boundary_refine_coef":        4.0,
-        "boundary_refine_giou_coef":   4.0,
+        "boundary_refine_coef":        3.0,
+        "boundary_refine_giou_coef":   3.0,
     }),
     (20, {
-        # Boundary refinement ramps — width+text conditioning now has gradient signal
-        "boundary_refine_coef":        5.0,
-        "boundary_refine_giou_coef":   5.0,
-        "aux_loss_scale":              0.3,
-        "set_cost_class":              2.5,
-        "set_cost_giou":               2.5,
+        # Smooth ramp at phase boundary to reduce one-epoch metric dips.
+        "boundary_refine_coef":        4.5,
+        "boundary_refine_giou_coef":   4.5,
+    }),
+    (30, {
+        # Delay auxiliary/matcher reduction to avoid the ep25 transition dip.
+        "aux_loss_scale":              0.15,
+        "set_cost_class":              2.1,
+        "set_cost_giou":               2.1,
+    }),
+    (35, {
+        # Continue matcher ramp gradually after adaptation.
+        "set_cost_class":              2.2,
+        "set_cost_giou":               2.2,
     }),
     (40, {
-        # IoU dominant — shift emphasis toward boundary precision
+        # Start smooth transition to IoU-dominant regime.
+        "span_loss_coef":              9.5,
+        "giou_loss_coef":              6.2,
+        "boundary_refine_coef":        5.0,
+        "boundary_refine_giou_coef":   5.0,
+        "contrastive_align_loss_coef": 0.12,
+        "loss_pop_coef":               0.08,
+        "set_cost_class":              2.4,
+        "set_cost_span":              10.0,
+        "set_cost_giou":               2.4,
+    }),
+    (42, {
+        # Mid-ramp: continue increasing IoU emphasis without abrupt jumps.
+        "span_loss_coef":              9.0,
+        "giou_loss_coef":              6.5,
+        "boundary_refine_coef":        5.4,
+        "boundary_refine_giou_coef":   5.4,
+        "contrastive_align_loss_coef": 0.10,
+        "loss_pop_coef":               0.07,
+        "set_cost_class":              2.6,
+        "set_cost_span":              10.0,
+        "set_cost_giou":               2.6,
+    }),
+    (44, {
+        # End-ramp target.
+        "span_loss_coef":              8.5,
+        "giou_loss_coef":              6.8,
+        "boundary_refine_coef":        5.8,
+        "boundary_refine_giou_coef":   5.8,
+        "contrastive_align_loss_coef": 0.08,
+        "loss_pop_coef":               0.06,
+        "set_cost_class":              2.8,
+        "set_cost_span":              10.0,
+        "set_cost_giou":               2.8,
+    }),
+    (46, {
+        # IoU dominant — shift emphasis toward boundary precision.
         "span_loss_coef":              8.0,
         "giou_loss_coef":              7.0,
-        "boundary_refine_coef":        6.0,   # v36: cap at 6.0 (not 8.0) — decoder leads
+        "boundary_refine_coef":        6.0,
         "boundary_refine_giou_coef":   6.0,
         "contrastive_align_loss_coef": 0.05,
         "loss_pop_coef":               0.05,
         "set_cost_class":              3.0,
-        "set_cost_span":               9.0,
+        "set_cost_span":              10.0,
         "set_cost_giou":               3.0,
     }),
+    (50, {
+        # Late training: reduce auxiliary deep supervision to prioritize final-layer precision.
+        "aux_loss_scale":              0.1,
+    }),
     (60, {
-        # Maximum boundary precision under cosine LR trough — cap at 6.0
+        # Keep refinement capped while late training focuses on hard IoU cases.
         "span_loss_coef":              6.0,
         "giou_loss_coef":              8.0,
-        "boundary_refine_coef":        6.0,   # v36: cap at 6.0 (not 10.0)
+        "boundary_refine_coef":        6.0,
         "boundary_refine_giou_coef":   6.0,
         "set_cost_class":              3.5,
+        "set_cost_span":              10.0,
+        "aux_loss_scale":              0.05,
     }),
 ]
 

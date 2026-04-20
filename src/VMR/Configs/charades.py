@@ -15,7 +15,7 @@ cfg = dict(_qvh.cfg)   # inherit defaults, then override
 
 cfg["seed"]          = 2026
 
-cfg["model_name"]    = "HLFormer_VMR_SFCB_v39"   # v37: align matcher/label span source with refined spans + increase query capacity
+cfg["model_name"]    = "HLFormer_VMR_SFCB_v40"
 cfg["dataset_name"]  = "charades_sta"
 cfg["dset_name"]     = "charades_sta"
 
@@ -52,12 +52,12 @@ cfg["v_feat_len_mode"] = "max"
 cfg["hidden_size"]    = 384   # v30: restored to 384; v28=320 hit capacity ceiling
 cfg["n_heads"]        = 6     # 384/8=48 per head
 cfg["num_queries"]    = 10    # v37: increase proposal capacity for better candidate coverage
-cfg["dec_layers"]     = 4     # v33: 6→4; fewer aux layers reduces gradient interference on 1-GT dataset
-cfg["input_drop"]     = 0.25   # v33: 0.35→0.2; heavy dropout was preventing fine boundary learning
-cfg["drop"]           = 0.15  # v33: 0.3→0.15; reduce regularization — plateau is generalization, not overfit
-cfg["txt_drop_ratio"] = 0.1   # v33: 0.15→0.1; lighter text dropout
-cfg["t2v_layers"]     = 4    # v17→v18: deeper cross-modal fusion for richer global_rep
-cfg["attention_num"]  = 6
+cfg["dec_layers"]     = 3
+cfg["input_drop"]     = 0.275
+cfg["drop"]           = 0.175
+cfg["txt_drop_ratio"] = 0.1
+cfg["t2v_layers"]     = 3
+cfg["attention_num"]  = 8
 cfg["pos_enc_type"]   = "trainable"
 cfg["sft_factor"]     = 0.1   # v11=0.06; stronger query-conditioned feature shift
 cfg["weight_token_mode"] = "hybrid"       # global | mean | hybrid
@@ -125,8 +125,8 @@ cfg["boundary_refine_coef"]           = 1.0   # phase-0 default; schedule ramps 
 cfg["boundary_refine_giou_coef"]      = 1.0
 cfg["boundary_refine_window"]         = 16     # v34: at max_v_l=77, sigma=16/154≈0.10 (10% of video); tight enough for precise boundary pooling
 cfg["boundary_refine_learnable_sigma"] = True
-cfg["boundary_refine_max_delta"]      = 0.2  # v36: 0.25→0.15; tighter cap, still ±11 frames at L=75
-cfg["alpha_iou_alpha"]                = 2.0   # v34: 2.5→3.0; stronger gradient amplification in 0.5-0.7 IoU zone
+cfg["boundary_refine_max_delta"]      = 0.2
+cfg["alpha_iou_alpha"]                = 2.5   # v34: 2.5→3.0; stronger gradient amplification in 0.5-0.7 IoU zone
 
 # aux_loss_scale starts low: early decoder layers produce near-zero IoU targets,
 # creating a strong "everything is background" pull if aux losses are weighted heavily.
@@ -149,8 +149,8 @@ cfg["lr"]            = 1.5e-4  # v34: 1e-4→2e-4; stronger gradient signal, mor
 cfg["lr_vid_enc"]    = 0.75e-4   # v34: 5e-5→1e-4; proportional to lr increase
 cfg["lr_drop"]       = 30     # kept for backward compat; unused when cosine_T0 > 0
 cfg["lr_gamma"]      = 0.5    # kept for backward compat
-cfg["warmup_epochs"] = 5     # v34: 5→10; longer warmup avoids early loss spikes with higher lr
-cfg["cosine_T0"]     = 35     # v34: 30→50; longer first cosine cycle gives more budget before LR trough
+cfg["warmup_epochs"] = 5
+cfg["cosine_T0"]     = 35
 cfg["cosine_Tmult"]  = 2      # v32: NEW; second cycle = 60 epochs (total ~90 before 2nd restart)
 cfg["cosine_eta_min_ratio"] = 0.01  # v32: NEW; min LR = 1% of base at cycle trough
 cfg["wd"]            = 5e-5   # v32: 5e-6→1e-4; 20x increase to regularize weights (5e-6 is effectively zero)
@@ -158,7 +158,7 @@ cfg["grad_clip"]     = 0.3
 
 # ---- EMA ----------------------------------------------------------------
 cfg["use_ema"]       = True   # v32: NEW; exponential moving average smooths val fluctuations (+1-2 R1)
-cfg["ema_decay"]     = 0.999  # v34: 0.999→0.9995; EMA tracks current model more closely during active learning
+cfg["ema_decay"]     = 0.999
 cfg["n_epoch"]       = 100
 cfg["max_es_cnt"]    = 20     # v17→v18: give more room after LR drop
 cfg["batchsize"]     = 32
@@ -182,12 +182,12 @@ cfg["aug_schedule"] = [
     }),
     (30, {
         "temporal_crop_ratio": 0.1,
-        "feat_mask_ratio":     0.1,
+        "feat_mask_ratio":     0.08,
         "gt_jitter_frames":    1,
     }),
     (45, {
-        "temporal_crop_ratio": 0.05,
-        "feat_mask_ratio":     0.05,
+        # "temporal_crop_ratio": 0.05,
+        # "feat_mask_ratio":     0.05,
         "gt_jitter_frames":    0,
     }),
 ]
@@ -212,7 +212,6 @@ cfg["iou_thresholds"] = [0.3, 0.5, 0.7]
 # Static cfg values above must match Phase 1 so build_criterion() starts correctly.
 cfg["loss_schedule"] = [
     (0, {
-        # v36: boundary refine starts at 1.0 to let text+width conditioning warm up first.
         "span_loss_coef":             10.0,
         "giou_loss_coef":              6.0,
         "boundary_refine_coef":        1.0,
@@ -229,23 +228,19 @@ cfg["loss_schedule"] = [
         "boundary_refine_giou_coef":   3.0,
     }),
     (20, {
-        # Smooth ramp at phase boundary to reduce one-epoch metric dips.
         "boundary_refine_coef":        4.5,
         "boundary_refine_giou_coef":   4.5,
     }),
-    (30, {
-        # Delay auxiliary/matcher reduction to avoid the ep25 transition dip.
-        "aux_loss_scale":              0.15,
-        "set_cost_class":              2.1,
-        "set_cost_giou":               2.1,
-    }),
-    (35, {
-        # Continue matcher ramp gradually after adaptation.
-        "set_cost_class":              2.2,
-        "set_cost_giou":               2.2,
-    }),
+    # (30, {
+    #     "aux_loss_scale":              0.15,
+    #     "set_cost_class":              2.1,
+    #     "set_cost_giou":               2.1,
+    # }),
+    # (35, {
+    #     "set_cost_class":              2.2,
+    #     "set_cost_giou":               2.2,
+    # }),
     (40, {
-        # Start smooth transition to IoU-dominant regime.
         "span_loss_coef":              9.5,
         "giou_loss_coef":              6.2,
         "boundary_refine_coef":        5.0,
@@ -257,19 +252,17 @@ cfg["loss_schedule"] = [
         "set_cost_giou":               2.4,
     }),
     (42, {
-        # Mid-ramp: continue increasing IoU emphasis without abrupt jumps.
         "span_loss_coef":              9.0,
         "giou_loss_coef":              6.5,
         "boundary_refine_coef":        5.4,
         "boundary_refine_giou_coef":   5.4,
-        "contrastive_align_loss_coef": 0.10,
+        "contrastive_align_loss_coef": 0.1,
         "loss_pop_coef":               0.07,
         "set_cost_class":              2.6,
         "set_cost_span":              10.0,
         "set_cost_giou":               2.6,
     }),
     (44, {
-        # End-ramp target.
         "span_loss_coef":              8.5,
         "giou_loss_coef":              6.8,
         "boundary_refine_coef":        5.8,
@@ -281,7 +274,6 @@ cfg["loss_schedule"] = [
         "set_cost_giou":               2.8,
     }),
     (46, {
-        # IoU dominant — shift emphasis toward boundary precision.
         "span_loss_coef":              8.0,
         "giou_loss_coef":              7.0,
         "boundary_refine_coef":        6.0,
@@ -293,11 +285,9 @@ cfg["loss_schedule"] = [
         "set_cost_giou":               3.0,
     }),
     (50, {
-        # Late training: reduce auxiliary deep supervision to prioritize final-layer precision.
         "aux_loss_scale":              0.1,
     }),
     (60, {
-        # Keep refinement capped while late training focuses on hard IoU cases.
         "span_loss_coef":              6.0,
         "giou_loss_coef":              8.0,
         "boundary_refine_coef":        6.0,
